@@ -1,4 +1,4 @@
-# ec2-pc
+# ec2-cp
 
 A file copy command for EC2. It works via SSM without SSH.
 

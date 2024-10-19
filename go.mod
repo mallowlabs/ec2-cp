@@ -3,7 +3,7 @@ module github.com/mallowlabs/ec2-cp
 go 1.22
 
 require (
-	github.com/aws/aws-sdk-go-v2/config v1.27.43
+	github.com/aws/aws-sdk-go-v2/config v1.28.0
 	github.com/mmmorris1975/ssm-session-client v0.401.1
 )
 

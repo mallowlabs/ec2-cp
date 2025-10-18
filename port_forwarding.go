@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -36,7 +37,7 @@ func openPortForwarding(cfg aws.Config, target string, remotePort int, localPort
 //
 //nolint:funlen,gocognit // it's long, but not overly hard to read despite what the gocognit says
 func startPortForwarding(c *datachannel.SsmDataChannel, localPort int) error {
-	if err := c.WaitForHandshakeComplete(); err != nil {
+	if err := c.WaitForHandshakeComplete(context.Background()); err != nil {
 		return err
 	}
 

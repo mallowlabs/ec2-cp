@@ -6,7 +6,7 @@ toolchain go1.24.1
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.31.13
-	github.com/mmmorris1975/ssm-session-client v0.401.1
+	github.com/mmmorris1975/ssm-session-client v0.402.0
 )
 
 require (

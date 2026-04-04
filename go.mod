@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.14
-	github.com/mmmorris1975/ssm-session-client v0.404.0
+	github.com/mmmorris1975/ssm-session-client v0.404.2
 )
 
 require github.com/aws/aws-sdk-go-v2/service/signin v1.0.9 // indirect

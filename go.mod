@@ -38,10 +38,10 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/twinj/uuid v0.0.0-20151029044442-89173bcdda19 // indirect
 	github.com/xtaci/smux v1.5.35 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
-	golang.org/x/net v0.56.0
+	golang.org/x/crypto v0.54.0 // indirect
+	golang.org/x/net v0.57.0
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/term v0.44.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

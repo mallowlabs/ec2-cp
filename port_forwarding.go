@@ -57,6 +57,13 @@ func startPortForwarding(c *datachannel.SsmDataChannel, localPort int, chunkSize
 	errCh := make(chan error)
 	inCh := messageChannel(c, errCh)
 
+	closeTransferDone := func() {
+		if transferDone != nil {
+			close(transferDone)
+			transferDone = nil
+		}
+	}
+
 outer:
 	for {
 		var conn net.Conn
@@ -85,10 +92,7 @@ outer:
 				// basic (non-muxing) connections support DisconnectPort to signal to the remote agent that
 				// we are shutting down this particular connection on our end, and possibly expect a new one.
 				_ = c.DisconnectPort()
-				if transferDone != nil {
-					close(transferDone)
-					transferDone = nil
-				}
+				closeTransferDone()
 				break inner
 			case data, ok := <-inCh:
 				if !ok {
@@ -111,10 +115,7 @@ outer:
 
 				// any write to errCh means at least 1 of the goroutines has exited
 				log.Print(er)
-				if transferDone != nil {
-					close(transferDone)
-					transferDone = nil
-				}
+				closeTransferDone()
 				break inner
 			}
 		}

@@ -46,16 +46,10 @@ func ec2Cp(localFile string, dest string) {
 		destFile = destFile + filepath.Base(localFile)
 	}
 
-	localSum, err := sha256File(localFile)
+	localSum, fileSize, err := sha256File(localFile)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	info, err := os.Stat(localFile)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fileSize := info.Size()
 
 	active := &activeSession{}
 	installSignalHandler(active)
@@ -96,10 +90,8 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 		return false, err
 	}
 	active.set(cnc, nil)
-	defer func() {
-		closeNc(cnc)
-		active.set(nil, nil)
-	}()
+	defer active.set(nil, nil)
+	defer closeNc(cnc)
 
 	log.Print("Starting port forwarding session")
 	cpw, err := openPortForwarding(cfg, target, port, port)
@@ -107,19 +99,14 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 		return false, err
 	}
 	active.set(cnc, cpw)
-	defer func() {
-		closePortForwarding(cpw)
-		active.set(nil, nil)
-	}()
+	defer closePortForwarding(cpw)
 
 	ready := make(chan struct{})
 	transferDone := make(chan struct{})
 	go startPortForwarding(cpw, port, chunkSize, ready, transferDone)
 
-	select {
-	case <-ready:
-	case <-time.After(30 * time.Second):
-		return false, errors.New("timed out waiting for the local port forwarding listener to be ready")
+	if err := waitOrTimeout(ready, 30*time.Second, "timed out waiting for the local port forwarding listener to be ready"); err != nil {
+		return false, err
 	}
 
 	log.Print("Sending file to target")
@@ -130,20 +117,16 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 	log.Printf("Sent %d bytes", written)
 
 	// Wait for the local relay to finish forwarding the data onto the websocket...
-	select {
-	case <-transferDone:
-	case <-time.After(relayTimeout):
-		return false, errors.New("timed out waiting for the local relay to finish")
+	if err := waitOrTimeout(transferDone, relayTimeout, "timed out waiting for the local relay to finish"); err != nil {
+		return false, err
 	}
 
 	// ...and then for the remote side to confirm it actually received all of it. There's a
 	// separate, independently-buffered hop from the SSM agent to tncl on the instance that has
 	// historically drained slower than this local relay, so the local relay finishing doesn't
 	// guarantee the file is complete yet.
-	select {
-	case <-remoteDone:
-	case <-time.After(remoteDrainTimeout):
-		return false, errors.New("timed out waiting for the remote agent to confirm the transfer finished")
+	if err := waitOrTimeout(remoteDone, remoteDrainTimeout, "timed out waiting for the remote agent to confirm the transfer finished"); err != nil {
+		return false, err
 	}
 
 	remoteSum, err := verifyRemoteSha256(cnc, destFile, 30*time.Second)
@@ -159,18 +142,33 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 	return true, nil
 }
 
-func sha256File(path string) (string, error) {
+// waitOrTimeout blocks until ch is closed or d elapses, in which case it returns an error with msg.
+func waitOrTimeout(ch <-chan struct{}, d time.Duration, msg string) error {
+	select {
+	case <-ch:
+		return nil
+	case <-time.After(d):
+		return errors.New(msg)
+	}
+}
+
+func sha256File(path string) (sum string, size int64, err error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer f.Close()
 
+	info, err := f.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+
 	h := sha256.New()
 	if _, err := io.Copy(h, f); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), info.Size(), nil
 }
 
 // activeSession tracks whichever channels the current retry attempt has open, so a signal
@@ -187,24 +185,26 @@ func (a *activeSession) set(cnc, cpw *datachannel.SsmDataChannel) {
 	a.cnc, a.cpw = cnc, cpw
 }
 
+func (a *activeSession) closeAll() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cnc != nil {
+		log.Print("Closing data channel (nc)")
+		closeNc(a.cnc)
+	}
+	if a.cpw != nil {
+		log.Print("Closing data channel (port forwarding)")
+		closePortForwarding(a.cpw)
+	}
+}
+
 func installSignalHandler(active *activeSession) {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGQUIT, syscall.SIGTERM)
 	go func() {
 		sig := <-sigCh
 		log.Printf("Got signal: %s, shutting down", sig.String())
-
-		active.mu.Lock()
-		defer active.mu.Unlock()
-		if active.cnc != nil {
-			log.Print("Closing data channel (nc)")
-			closeNc(active.cnc)
-		}
-		if active.cpw != nil {
-			log.Print("Closing data channel (port forwarding)")
-			closePortForwarding(active.cpw)
-		}
-
+		active.closeAll()
 		os.Exit(0)
 	}()
 }

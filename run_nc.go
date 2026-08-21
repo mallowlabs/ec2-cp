@@ -129,6 +129,41 @@ func sendKeepalive(c *datachannel.SsmDataChannel, remoteDone <-chan struct{}) {
 	}
 }
 
+// maxSeenBuffer bounds how much trailing output streamRemoteOutput and verifyRemoteSha256 keep
+// around while scanning for a marker, so a long-idle session -- kept alive by periodic keepalive
+// newlines during a long transfer -- doesn't grow that buffer for as long as the session is open.
+// It's generous relative to the longest marker/pattern being searched for (well under 100 bytes),
+// leaving plenty of overlap to catch one split across two reads.
+const maxSeenBuffer = 4096
+
+func trimSeen(b *strings.Builder) {
+	if b.Len() <= maxSeenBuffer {
+		return
+	}
+	tail := b.String()[b.Len()-maxSeenBuffer:]
+	b.Reset()
+	b.WriteString(tail)
+}
+
+// readPayload reads and decodes the next message from c. err is set only for a genuine failure to
+// read or decode; a clean channel closure is reported via eof instead (with payload still holding
+// any final bytes that arrived alongside it, which callers should process before checking eof).
+func readPayload(c *datachannel.SsmDataChannel, buf []byte) (payload []byte, eof bool, err error) {
+	n, err := c.Read(buf)
+	if err != nil {
+		return nil, false, err
+	}
+
+	payload, handleErr := c.HandleMsg(buf[:n])
+	if handleErr != nil {
+		if errors.Is(handleErr, io.EOF) {
+			return payload, true, nil
+		}
+		return payload, false, handleErr
+	}
+	return payload, false, nil
+}
+
 // streamRemoteOutput drains and logs the shell session's output (prefixed with "[remote]") so
 // failures on the remote side (a failed curl, a tncl crash, ...) are visible instead of silently
 // vanishing. It reports on ready exactly once, the moment readyMarker is actually printed (not just
@@ -141,15 +176,7 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remot
 	readyFound := false
 
 	for {
-		n, err := c.Read(buf)
-		if err != nil {
-			if !readyFound {
-				ready <- fmt.Errorf("waiting for remote agent to become ready: %w", err)
-			}
-			return
-		}
-
-		payload, handleErr := c.HandleMsg(buf[:n])
+		payload, eof, err := readPayload(c, buf)
 		if len(payload) > 0 {
 			for line := range strings.SplitSeq(strings.TrimRight(string(payload), "\r\n"), "\n") {
 				if line != "" {
@@ -158,6 +185,7 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remot
 			}
 
 			seen.Write(payload)
+			trimSeen(&seen)
 			if !readyFound && strings.Contains(seen.String(), readyMarker) {
 				readyFound = true
 				ready <- nil
@@ -168,13 +196,13 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remot
 			}
 		}
 
-		if handleErr != nil && !errors.Is(handleErr, io.EOF) {
+		if err != nil {
 			if !readyFound {
-				ready <- fmt.Errorf("waiting for remote agent to become ready: %w", handleErr)
+				ready <- fmt.Errorf("waiting for remote agent to become ready: %w", err)
 			}
 			return
 		}
-		if errors.Is(handleErr, io.EOF) {
+		if eof {
 			return
 		}
 	}
@@ -194,23 +222,19 @@ func verifyRemoteSha256(c *datachannel.SsmDataChannel, remoteFile string, timeou
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
-		n, err := c.Read(buf)
-		if err != nil {
-			return "", err
-		}
-
-		payload, handleErr := c.HandleMsg(buf[:n])
+		payload, eof, err := readPayload(c, buf)
 		if len(payload) > 0 {
 			seen.Write(payload)
+			trimSeen(&seen)
 			if m := sha256LinePattern.FindStringSubmatch(seen.String()); m != nil {
 				return m[1], nil
 			}
 		}
 
-		if handleErr != nil && !errors.Is(handleErr, io.EOF) {
-			return "", handleErr
+		if err != nil {
+			return "", err
 		}
-		if errors.Is(handleErr, io.EOF) {
+		if eof {
 			return "", errors.New("remote session closed before checksum was reported")
 		}
 	}

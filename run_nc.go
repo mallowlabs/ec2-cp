@@ -29,6 +29,16 @@ const readyMarker = "___EC2_CP_READY___"
 // what the checksum step is for).
 const doneMarker = "___EC2_CP_DONE___"
 
+// setupFailedMarker is echoed instead of readyMarker when the remote side could not get tncl
+// installed at all -- an unsupported CPU architecture, a failed download. Without it the client
+// would sit through the full ready timeout before reporting a generic failure, even though the
+// remote shell already knows the attempt is doomed.
+const setupFailedMarker = "___EC2_CP_SETUP_FAILED___"
+
+// tnclVersion is the tncl release the remote agent is fetched from. Both supported architectures
+// are published under the same tag, so the download URL only varies by architecture.
+const tnclVersion = "v0.0.4"
+
 var sha256LinePattern = regexp.MustCompile(`\b([0-9a-f]{64})\b`)
 
 // echoQuoted splits a marker into two halves joined as adjacent quoted strings, e.g. "ABCD" becomes
@@ -43,11 +53,13 @@ func echoQuoted(marker string) string {
 }
 
 type bootAgentTmplData struct {
-	Cmd           string
-	Port          int
-	Filename      string
-	ReadyEchoExpr string
-	DoneEchoExpr  string
+	Cmd                 string
+	Port                int
+	Filename            string
+	URLTmpl             string
+	ReadyEchoExpr       string
+	SetupFailedEchoExpr string
+	DoneEchoExpr        string
 }
 
 // tncl exits its whole process (via std.process.exit) the instant its own stdin reaches EOF, which
@@ -56,12 +68,18 @@ type bootAgentTmplData struct {
 // for the life of the transfer, while still letting the shell regain control as soon as tncl exits
 // -- a plain `sleep infinity | tncl ...` pipe would leave the shell waiting on the whole pipeline,
 // which never finishes since sleep never exits, so it'd never see our next command.
+//
+// tncl names its release assets after the `uname -m` output of the architecture they run on
+// ("x86_64", "aarch64"), so the instance picks its own binary: asking EC2 which architecture it is
+// would need ec2:DescribeInstances, well beyond the AmazonSSMManagedInstanceCore policy this tool
+// documents as its only requirement. Architectures tncl publishes no build for are rejected up
+// front, rather than downloading a 404 body and failing later as a confusing "not executable".
 var bootAgentTmpl = template.Must(template.New("").Parse(
 	`sudo su
 cd /root/
-curl --silent -L -o {{.Cmd}} "https://github.com/fujiwara/tncl/releases/download/v0.0.4/tncl-x86_64-linux-musl"
-chmod +x {{.Cmd}}
-echo {{.ReadyEchoExpr}}
+arch="$(uname -m)"
+setup() { case "$arch" in x86_64|aarch64) ;; *) echo "unsupported architecture: $arch" >&2; return 1;; esac; curl --silent --fail -L -o {{.Cmd}} "{{.URLTmpl}}" && chmod +x {{.Cmd}}; }
+setup && echo {{.ReadyEchoExpr}} || echo {{.SetupFailedEchoExpr}}
 {{.Cmd}} {{.Port}} < <(sleep infinity) > "{{.Filename}}"
 echo {{.DoneEchoExpr}}
 `))
@@ -74,7 +92,10 @@ func runNc(cfg aws.Config, target string, remoteFile string, port int) (*datacha
 	buf := &strings.Builder{}
 	bootAgentTmpl.Execute(buf, bootAgentTmplData{
 		Cmd: "/tmp/tncl", Port: port, Filename: remoteFile,
-		ReadyEchoExpr: echoQuoted(readyMarker), DoneEchoExpr: echoQuoted(doneMarker)})
+		// $arch is expanded by the remote shell, not here.
+		URLTmpl:       "https://github.com/fujiwara/tncl/releases/download/" + tnclVersion + "/tncl-$arch-linux-musl",
+		ReadyEchoExpr: echoQuoted(readyMarker), SetupFailedEchoExpr: echoQuoted(setupFailedMarker),
+		DoneEchoExpr: echoQuoted(doneMarker)})
 	cmd := buf.String()
 
 	c := new(datachannel.SsmDataChannel)
@@ -164,8 +185,9 @@ func readPayload(c *datachannel.SsmDataChannel, buf []byte) (payload []byte, eof
 // streamRemoteOutput drains and logs the shell session's output (prefixed with "[remote]") so
 // failures on the remote side (a failed curl, a tncl crash, ...) are visible instead of silently
 // vanishing. It closes ready exactly once, the moment readyMarker is actually printed (not just
-// echoed as typed input) or the read loop ends before that happens -- in the latter case *readyErr
-// is set first, so the caller should check it once ready is closed. It closes remoteDone exactly
+// echoed as typed input), or the moment the remote reports it could not install tncl at all, or
+// the read loop ends before either happens -- in the latter two cases *readyErr is set first, so
+// the caller should check it once ready is closed. It closes remoteDone exactly
 // once no matter how the loop ends, so a caller (e.g. sendKeepalive) blocked on it never leaks past
 // this attempt: on success that's the moment doneMarker is actually printed, at which point nothing
 // else will read from c and the caller may safely start reading it again.
@@ -188,6 +210,12 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, readyErr *error, ready ch
 
 			seen.Write(payload)
 			trimSeen(&seen)
+			if !readyFound && strings.Contains(seen.String(), setupFailedMarker) {
+				readyFound = true
+				*readyErr = errors.New("remote agent setup failed, see the [remote] output above")
+				close(ready)
+				return
+			}
 			if !readyFound && strings.Contains(seen.String(), readyMarker) {
 				readyFound = true
 				close(ready)

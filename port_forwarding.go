@@ -2,12 +2,10 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"log"
 	"net"
 	"strconv"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -33,135 +31,66 @@ func openPortForwarding(cfg aws.Config, target string, remotePort int, localPort
 	return c, nil
 }
 
-// PortForwardingSession starts a port forwarding session using the PortForwardingInput parameters to
-// configure the session.  The aws.Config parameter will be used to call the AWS SSM StartSession
-// API, which is used as part of establishing the websocket communication channel.
-//
-//nolint:funlen,gocognit // it's long, but not overly hard to read despite what the gocognit says
-func startPortForwarding(c *datachannel.SsmDataChannel, localPort int, chunkSize int, ready chan<- struct{}, transferDone chan<- struct{}) error {
-	if err := c.WaitForHandshakeComplete(context.Background()); err != nil {
+// startPortForwarding accepts the single local connection carrying the file and relays it over the
+// SSM data channel, returning once the SSM agent has acknowledged every byte of it (or the relay
+// fails). ready is closed as soon as the local listener can be dialled.
+func startPortForwarding(c *datachannel.SsmDataChannel, localPort int, ready chan<- struct{}, active *activeSession) error {
+	// Until the relay below takes the channel over, this is the only way to shut it down: the
+	// library's own terminate is still the right one to use, because nothing has diverged from its
+	// sequence counter yet.
+	fail := func(err error) error {
 		close(ready)
+		_ = c.TerminateSession()
+		_ = c.Close()
 		return err
+	}
+
+	if err := c.WaitForHandshakeComplete(context.Background()); err != nil {
+		return fail(err)
 	}
 
 	lsnr, err := createListener(localPort)
 	if err != nil {
-		close(ready)
-		return err
+		return fail(err)
 	}
 	defer lsnr.Close()
 	log.Printf("listening on %s", lsnr.Addr())
-	// Signal readiness now (the caller starts sending as soon as this fires), not via a deferred
-	// close at function exit -- this function keeps running the accept loop below for the life of
-	// the whole transfer, well after the listener is actually ready to accept.
+	// Signal readiness now, before the blocking Accept below: the caller starts sending as soon as
+	// this fires, and that connection is what Accept is waiting for.
 	close(ready)
 
-	doneCh := make(chan bool)
-	errCh := make(chan error)
-	inCh := messageChannel(c, errCh)
+	rc := newReliableChannel(c)
+	active.setRelay(rc)
+	defer rc.close()
 
-	closeTransferDone := func() {
-		if transferDone != nil {
-			close(transferDone)
-			transferDone = nil
+	conn, err := lsnr.Accept()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	go func() {
+		for data := range rc.inbound {
+			if _, err := conn.Write(data); err != nil {
+				log.Print(err)
+				return
+			}
 		}
+	}()
+
+	// Forward local -> remote. rc paces this by itself: it blocks whenever the send window is full
+	// of unacknowledged messages, so there is no need to guess at a safe rate.
+	if _, err := io.Copy(rc, conn); err != nil {
+		return err
 	}
 
-outer:
-	for {
-		var conn net.Conn
-		conn, err = lsnr.Accept()
-		if err != nil {
-			// not fatal, just wait for next (maybe unless lsnr is dead?)
-			log.Print(err)
-			continue
-		}
-
-		go func() {
-			// Forward local -> remote. The SSM agent's own hop from the websocket to the
-			// target port on the instance can't sustain the same throughput as this local
-			// relay; pushing data in as fast as io.Copy would silently loses most of it
-			// somewhere along that path, so pace it instead.
-			if e := throttledCopy(c, conn, chunkSize); e != nil {
-				errCh <- e
-			}
-			doneCh <- true
-		}()
-
-	inner:
-		for {
-			select {
-			case <-doneCh:
-				// basic (non-muxing) connections support DisconnectPort to signal to the remote agent that
-				// we are shutting down this particular connection on our end, and possibly expect a new one.
-				_ = c.DisconnectPort()
-				closeTransferDone()
-				break inner
-			case data, ok := <-inCh:
-				if !ok {
-					// incoming websocket channel is closed, which is fatal
-					_ = conn.Close()
-					break outer
-				}
-
-				if _, err = conn.Write(data); err != nil {
-					log.Print(err)
-				}
-			case er, ok := <-errCh:
-				if !ok {
-					// I can't think of a good reason why we'd ever end up here, but if we do
-					// we should stop the world
-					log.Print("errCh closed")
-					_ = conn.Close()
-					break outer
-				}
-
-				// any write to errCh means at least 1 of the goroutines has exited
-				log.Print(er)
-				closeTransferDone()
-				break inner
-			}
-		}
-
-		_ = conn.Close()
+	// io.Copy returning only means the bytes are on the websocket. Wait for the agent to
+	// acknowledge all of them before telling it to hang up on the remote listener, otherwise the
+	// disconnect can overtake a message still being retransmitted.
+	if err := rc.waitAcked(); err != nil {
+		return err
 	}
-	return nil
-}
-
-// throttleBytesPerSec is the target sustained rate for throttledCopy; ec2_cp.go uses it to size
-// how long it's worth waiting for the remote side to confirm a transfer actually completed.
-const throttleBytesPerSec = 32 * 1024
-
-// throttledCopy is like io.Copy but paces its writes: the SSM agent's hop from the websocket to
-// the target port on the instance has much less headroom than this local, kernel-buffered relay,
-// and writing at full speed overruns it, with the excess getting dropped rather than backed up.
-// The loss that remains at a sustainable rate lands on the same bytes every time for a given
-// chunkSize, so callers should vary chunkSize across retries rather than just retrying as-is.
-func throttledCopy(dst io.Writer, src io.Reader, chunkSize int) error {
-	pause := time.Duration(chunkSize) * time.Second / throttleBytesPerSec
-
-	buf := make([]byte, chunkSize)
-	for {
-		nr, err := src.Read(buf)
-		if nr > 0 {
-			if _, werr := dst.Write(buf[:nr]); werr != nil {
-				return werr
-			}
-			time.Sleep(pause)
-		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-	}
-}
-
-func closePortForwarding(c *datachannel.SsmDataChannel) {
-	_ = c.DisconnectPort()
-	_ = c.TerminateSession()
-	_ = c.Close()
+	return rc.disconnectPort()
 }
 
 func openDataChannel(cfg aws.Config, opts *ssmclient.PortForwardingInput) (*datachannel.SsmDataChannel, error) {
@@ -179,38 +108,6 @@ func openDataChannel(cfg aws.Config, opts *ssmclient.PortForwardingInput) (*data
 		return nil, err
 	}
 	return c, nil
-}
-
-// read messages from websocket and write payload to the returned channel.
-func messageChannel(c datachannel.DataChannel, errCh chan error) chan []byte {
-	inCh := make(chan []byte)
-
-	buf := make([]byte, 4096)
-	var payload []byte
-
-	go func() {
-		defer close(inCh)
-
-		for {
-			nr, err := c.Read(buf)
-			if err != nil {
-				errCh <- err
-				return
-			}
-
-			payload, err = c.HandleMsg(buf[:nr])
-			if err != nil {
-				errCh <- err
-				return
-			}
-
-			if len(payload) > 0 {
-				inCh <- payload
-			}
-		}
-	}()
-
-	return inCh
 }
 
 func createListener(port int) (net.Listener, error) {

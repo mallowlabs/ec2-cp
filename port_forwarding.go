@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"strconv"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -36,17 +38,20 @@ func openPortForwarding(cfg aws.Config, target string, remotePort int, localPort
 // API, which is used as part of establishing the websocket communication channel.
 //
 //nolint:funlen,gocognit // it's long, but not overly hard to read despite what the gocognit says
-func startPortForwarding(c *datachannel.SsmDataChannel, localPort int) error {
+func startPortForwarding(c *datachannel.SsmDataChannel, localPort int, chunkSize int, ready chan<- struct{}, transferDone chan<- struct{}) error {
 	if err := c.WaitForHandshakeComplete(context.Background()); err != nil {
+		close(ready)
 		return err
 	}
 
 	lsnr, err := createListener(localPort)
 	if err != nil {
+		close(ready)
 		return err
 	}
 	defer lsnr.Close()
 	log.Printf("listening on %s", lsnr.Addr())
+	close(ready)
 
 	doneCh := make(chan bool)
 	errCh := make(chan error)
@@ -63,8 +68,11 @@ outer:
 		}
 
 		go func() {
-			// handle incoming messages from AWS in the background
-			if _, e := io.Copy(c, conn); e != nil {
+			// Forward local -> remote. The SSM agent's own hop from the websocket to the
+			// target port on the instance can't sustain the same throughput as this local
+			// relay; pushing data in as fast as io.Copy would silently loses most of it
+			// somewhere along that path, so pace it instead.
+			if e := throttledCopy(c, conn, chunkSize); e != nil {
 				errCh <- e
 			}
 			doneCh <- true
@@ -77,6 +85,10 @@ outer:
 				// basic (non-muxing) connections support DisconnectPort to signal to the remote agent that
 				// we are shutting down this particular connection on our end, and possibly expect a new one.
 				_ = c.DisconnectPort()
+				if transferDone != nil {
+					close(transferDone)
+					transferDone = nil
+				}
 				break inner
 			case data, ok := <-inCh:
 				if !ok {
@@ -99,6 +111,10 @@ outer:
 
 				// any write to errCh means at least 1 of the goroutines has exited
 				log.Print(er)
+				if transferDone != nil {
+					close(transferDone)
+					transferDone = nil
+				}
 				break inner
 			}
 		}
@@ -106,6 +122,36 @@ outer:
 		_ = conn.Close()
 	}
 	return nil
+}
+
+// throttleBytesPerSec is the target sustained rate for throttledCopy; ec2_cp.go uses it to size
+// how long it's worth waiting for the remote side to confirm a transfer actually completed.
+const throttleBytesPerSec = 32 * 1024
+
+// throttledCopy is like io.Copy but paces its writes: the SSM agent's hop from the websocket to
+// the target port on the instance has much less headroom than this local, kernel-buffered relay,
+// and writing at full speed overruns it, with the excess getting dropped rather than backed up.
+// The loss that remains at a sustainable rate lands on the same bytes every time for a given
+// chunkSize, so callers should vary chunkSize across retries rather than just retrying as-is.
+func throttledCopy(dst io.Writer, src io.Reader, chunkSize int) error {
+	pause := time.Duration(chunkSize) * time.Second / throttleBytesPerSec
+
+	buf := make([]byte, chunkSize)
+	for {
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			if _, werr := dst.Write(buf[:nr]); werr != nil {
+				return werr
+			}
+			time.Sleep(pause)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+	}
 }
 
 func closePortForwarding(c *datachannel.SsmDataChannel) {

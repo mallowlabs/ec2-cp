@@ -18,7 +18,6 @@ func main() {
 
 	src := os.Args[1]  // /path/to/local/file
 	dest := os.Args[2] // target:/path/to/remote/file
-	port := 12345
 
-	ec2Cp(src, dest, port)
+	ec2Cp(src, dest)
 }

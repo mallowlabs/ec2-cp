@@ -25,7 +25,7 @@ $ ec2-cp /path/to/local/file i-i-012345678901abcdef:/path/to/remote/file
   * Sessions may sometimes remain
 * EC2 limitations
   * `ssm-user` needs to be able to become `root`
-  * `x86_64` only support
+  * `x86_64` and `arm64` only support
   * Internet access is needed
 
 ## Credits

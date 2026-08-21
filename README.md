@@ -11,7 +11,7 @@ $ ec2-cp <src> <dest>
 ## Example
 
 ```sh
-$ ec2-cp /path/to/local/file i-i-012345678901abcdef:/path/to/remote/file
+$ ec2-cp /path/to/local/file i-012345678901abcdef:/path/to/remote/file
 ```
 
 ## Required IAM Policy

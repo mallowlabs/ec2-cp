@@ -22,17 +22,17 @@ import (
 	"github.com/mmmorris1975/ssm-session-client/datachannel"
 )
 
-// The AWS SSM port-forwarding relay used to reach tncl is not fully reliable for bulk transfers:
-// under sustained load a small fraction of the data can go missing between the SSM agent and the
-// target port without either side reporting an error (see throttledCopy in port_forwarding.go).
-// Verifying the remote checksum and retrying on mismatch turns that into a rare extra attempt
-// instead of silent corruption.
-const maxAttempts = 5
+// Acknowledgements only cover the path as far as the SSM agent; the agent's own hop to tncl and
+// tncl's write to the file are unobserved, and runNc documents that hop failing silently. The
+// checksum is the only end-to-end check, so retrying on a mismatch stays. Note this now only helps
+// against transient failures -- with the chunk size cycling gone, the attempts are identical, so
+// anything deterministic (a raised maxPayloadSize, say) just fails three times.
+const maxAttempts = 3
 
-// chunkSizes are cycled across attempts. The loss throttledCopy can't avoid lands on the same
-// bytes every time for a given chunk size, so retrying with the same size would just fail the same
-// way again; varying it changes which message/write boundaries the data falls on.
-var chunkSizes = []int{4096, 2731, 6151, 1523, 8209}
+// minExpectedBytesPerSec is a deliberately pessimistic floor on how fast a transfer runs, used only
+// so the timeouts below scale with the size of the file instead of being a fixed value that a large
+// transfer trips over. It is not a rate limit.
+const minExpectedBytesPerSec = 128 * 1024
 
 func ec2Cp(localFile string, dest string) {
 	cfg, err := config.LoadDefaultConfig(context.Background())
@@ -60,8 +60,7 @@ func ec2Cp(localFile string, dest string) {
 		port := 20000 + rand.Intn(20000)
 		log.Printf("Attempt %d/%d (port %d)", attempt, maxAttempts, port)
 
-		chunkSize := chunkSizes[(attempt-1)%len(chunkSizes)]
-		ok, err := attemptTransfer(cfg, target, destFile, localFile, localSum, fileSize, port, chunkSize, active)
+		ok, err := attemptTransfer(cfg, target, destFile, localFile, localSum, fileSize, port, active)
 		if err != nil {
 			log.Printf("Attempt failed: %v", err)
 			continue
@@ -76,13 +75,14 @@ func ec2Cp(localFile string, dest string) {
 	log.Fatalf("failed to transfer %s after %d attempts", localFile, maxAttempts)
 }
 
-func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum string, fileSize int64, port int, chunkSize int, active *activeSession) (bool, error) {
-	// The remote hop (SSM agent -> tncl) has historically drained no faster than the throttled
-	// send rate, and sometimes noticeably slower, so give it a generous multiple of the time the
-	// send itself is expected to take rather than a fixed timeout that doesn't scale with size.
-	expectedTransferTime := time.Duration(fileSize) * time.Second / throttleBytesPerSec
-	relayTimeout := 60*time.Second + 2*expectedTransferTime
-	remoteDrainTimeout := 60*time.Second + 4*expectedTransferTime
+func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum string, fileSize int64, port int, active *activeSession) (bool, error) {
+	expectedTransferTime := time.Duration(fileSize) * time.Second / minExpectedBytesPerSec
+	// An outer bound, not a health check: the relay decides for itself whether the channel has gone
+	// quiet (see stalledLocked), so this only exists so a wedged goroutine can't hang the program.
+	relayTimeout := 120*time.Second + 2*expectedTransferTime
+	// The SSM agent has acknowledged every byte by the time the relay finishes, so all that's left
+	// here is the agent handing them to tncl on the instance.
+	remoteDrainTimeout := 60*time.Second + expectedTransferTime
 	log.Print("Executing nc command (nc)")
 	// runNc blocks until the remote agent has confirmed it is about to start listening.
 	cnc, remoteDone, err := runNc(cfg, target, destFile, port)
@@ -99,32 +99,42 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 		return false, err
 	}
 	active.set(cnc, cpw)
-	defer closePortForwarding(cpw)
+	defer func() { _ = cpw.Close() }()
 
 	ready := make(chan struct{})
-	transferDone := make(chan struct{})
-	go startPortForwarding(cpw, port, chunkSize, ready, transferDone)
+	relayDone := make(chan error, 1)
+	go func() { relayDone <- startPortForwarding(cpw, port, ready, active) }()
 
 	if err := waitOrTimeout(ready, 30*time.Second, "timed out waiting for the local port forwarding listener to be ready"); err != nil {
 		return false, err
 	}
 
 	log.Print("Sending file to target")
-	written, err := sendFile(localFile, port)
-	if err != nil {
-		return false, err
-	}
-	log.Printf("Sent %d bytes", written)
+	started := time.Now()
+	written, sendErr := sendFile(localFile, port)
 
-	// Wait for the local relay to finish forwarding the data onto the websocket...
-	if err := waitOrTimeout(transferDone, relayTimeout, "timed out waiting for the local relay to finish"); err != nil {
-		return false, err
+	// The relay closes the local connection once it's done, so sendFile returning is immediately
+	// followed by the relay's result. Read that first: when the relay is what failed, sendFile's
+	// error is just the fallout of it hanging up, and the relay's is the one worth reporting.
+	select {
+	case err := <-relayDone:
+		if err != nil {
+			return false, fmt.Errorf("relaying the file over SSM: %w", err)
+		}
+	case <-time.After(relayTimeout):
+		return false, errors.New("timed out waiting for the local relay to finish")
+	}
+	if sendErr != nil {
+		return false, sendErr
 	}
 
-	// ...and then for the remote side to confirm it actually received all of it. There's a
-	// separate, independently-buffered hop from the SSM agent to tncl on the instance that has
-	// historically drained slower than this local relay, so the local relay finishing doesn't
-	// guarantee the file is complete yet.
+	elapsed := time.Since(started)
+	log.Printf("Sent %d bytes in %s (%.0f KiB/s)", written, elapsed.Round(time.Millisecond),
+		float64(written)/1024/elapsed.Seconds())
+
+	// The relay finishing means the SSM agent acknowledged every byte, but there's still a
+	// separately-buffered hop from the agent to tncl on the instance, so the file isn't necessarily
+	// complete yet.
 	if err := waitOrTimeout(remoteDone, remoteDrainTimeout, "timed out waiting for the remote agent to confirm the transfer finished"); err != nil {
 		return false, err
 	}
@@ -177,12 +187,21 @@ type activeSession struct {
 	mu  sync.Mutex
 	cnc *datachannel.SsmDataChannel
 	cpw *datachannel.SsmDataChannel
+	rc  *reliableChannel
 }
 
 func (a *activeSession) set(cnc, cpw *datachannel.SsmDataChannel) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.cnc, a.cpw = cnc, cpw
+	a.cnc, a.cpw, a.rc = cnc, cpw, nil
+}
+
+// setRelay records the relay layered over cpw, which owns the sequence numbering the port
+// forwarding session's terminate message has to use.
+func (a *activeSession) setRelay(rc *reliableChannel) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.rc = rc
 }
 
 func (a *activeSession) closeAll() {
@@ -194,7 +213,11 @@ func (a *activeSession) closeAll() {
 	}
 	if a.cpw != nil {
 		log.Print("Closing data channel (port forwarding)")
-		closePortForwarding(a.cpw)
+		if a.rc != nil {
+			a.rc.close()
+		} else {
+			_ = a.cpw.Close()
+		}
 	}
 }
 

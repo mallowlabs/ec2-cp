@@ -7,6 +7,7 @@ import (
 	"log"
 	"regexp"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -27,9 +28,6 @@ const readyMarker = "___EC2_CP_READY___"
 // reliable "the transfer attempt is over" signal (whether or not it actually succeeded -- that's
 // what the checksum step is for).
 const doneMarker = "___EC2_CP_DONE___"
-
-// checksumDoneMarker terminates the checksum command's output so we know when to stop waiting.
-const checksumDoneMarker = "___EC2_CP_CHECKSUM_DONE___"
 
 var sha256LinePattern = regexp.MustCompile(`\b([0-9a-f]{64})\b`)
 
@@ -89,9 +87,10 @@ func runNc(cfg aws.Config, target string, remoteFile string, port int) (*datacha
 		return c, nil, err
 	}
 
-	ready := make(chan error, 1)
+	var readyErr error
+	ready := make(chan struct{})
 	remoteDone := make(chan struct{})
-	go streamRemoteOutput(c, ready, remoteDone)
+	go streamRemoteOutput(c, &readyErr, ready, remoteDone)
 	// This shell session sits completely idle for the whole transfer -- all the actual traffic
 	// flows over the separate port-forwarding channel -- and AWS API Gateway websocket
 	// connections are dropped after ~10 minutes of inactivity. A large transfer easily takes
@@ -100,13 +99,11 @@ func runNc(cfg aws.Config, target string, remoteFile string, port int) (*datacha
 	// later (queued behind the still-running tncl command).
 	go sendKeepalive(c, remoteDone)
 
-	select {
-	case err := <-ready:
-		if err != nil {
-			return c, remoteDone, err
-		}
-	case <-time.After(60 * time.Second):
-		return c, remoteDone, errors.New("timed out waiting for remote agent to become ready")
+	if err := waitOrTimeout(ready, 60*time.Second, "timed out waiting for remote agent to become ready"); err != nil {
+		return c, remoteDone, err
+	}
+	if readyErr != nil {
+		return c, remoteDone, readyErr
 	}
 
 	return c, remoteDone, nil
@@ -166,11 +163,16 @@ func readPayload(c *datachannel.SsmDataChannel, buf []byte) (payload []byte, eof
 
 // streamRemoteOutput drains and logs the shell session's output (prefixed with "[remote]") so
 // failures on the remote side (a failed curl, a tncl crash, ...) are visible instead of silently
-// vanishing. It reports on ready exactly once, the moment readyMarker is actually printed (not just
-// echoed as typed input), and closes remoteDone and returns exactly once, the moment doneMarker is
-// actually printed -- at which point nothing else will read from c, and the caller may safely start
-// reading it again.
-func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remoteDone chan<- struct{}) {
+// vanishing. It closes ready exactly once, the moment readyMarker is actually printed (not just
+// echoed as typed input) or the read loop ends before that happens -- in the latter case *readyErr
+// is set first, so the caller should check it once ready is closed. It closes remoteDone exactly
+// once no matter how the loop ends, so a caller (e.g. sendKeepalive) blocked on it never leaks past
+// this attempt: on success that's the moment doneMarker is actually printed, at which point nothing
+// else will read from c and the caller may safely start reading it again.
+func streamRemoteOutput(c *datachannel.SsmDataChannel, readyErr *error, ready chan<- struct{}, remoteDone chan struct{}) {
+	closeRemoteDoneOnce := sync.OnceFunc(func() { close(remoteDone) })
+	defer closeRemoteDoneOnce()
+
 	buf := make([]byte, 4096)
 	var seen strings.Builder
 	readyFound := false
@@ -188,17 +190,17 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remot
 			trimSeen(&seen)
 			if !readyFound && strings.Contains(seen.String(), readyMarker) {
 				readyFound = true
-				ready <- nil
+				close(ready)
 			}
 			if strings.Contains(seen.String(), doneMarker) {
-				close(remoteDone)
 				return
 			}
 		}
 
 		if err != nil {
 			if !readyFound {
-				ready <- fmt.Errorf("waiting for remote agent to become ready: %w", err)
+				*readyErr = fmt.Errorf("waiting for remote agent to become ready: %w", err)
+				close(ready)
 			}
 			return
 		}
@@ -211,15 +213,15 @@ func streamRemoteOutput(c *datachannel.SsmDataChannel, ready chan<- error, remot
 // verifyRemoteSha256 runs sha256sum on the remote file over the still-open shell session and
 // returns the hash it reports. Must only be called after remoteDone has fired, so nothing else is
 // concurrently reading c.
-func verifyRemoteSha256(c *datachannel.SsmDataChannel, remoteFile string, timeout time.Duration) (string, error) {
-	cmd := fmt.Sprintf("sha256sum %q; echo %s\n", remoteFile, checksumDoneMarker)
+func verifyRemoteSha256(c *datachannel.SsmDataChannel, remoteFile string) (string, error) {
+	cmd := fmt.Sprintf("sha256sum %q\n", remoteFile)
 	if _, err := io.Copy(c, strings.NewReader(cmd)); err != nil {
 		return "", err
 	}
 
 	buf := make([]byte, 4096)
 	var seen strings.Builder
-	deadline := time.Now().Add(timeout)
+	deadline := time.Now().Add(30 * time.Second)
 
 	for time.Now().Before(deadline) {
 		payload, eof, err := readPayload(c, buf)

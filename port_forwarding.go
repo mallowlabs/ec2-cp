@@ -51,6 +51,9 @@ func startPortForwarding(c *datachannel.SsmDataChannel, localPort int, chunkSize
 	}
 	defer lsnr.Close()
 	log.Printf("listening on %s", lsnr.Addr())
+	// Signal readiness now (the caller starts sending as soon as this fires), not via a deferred
+	// close at function exit -- this function keeps running the accept loop below for the life of
+	// the whole transfer, well after the listener is actually ready to accept.
 	close(ready)
 
 	doneCh := make(chan bool)

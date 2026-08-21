@@ -129,7 +129,7 @@ func attemptTransfer(cfg aws.Config, target, destFile, localFile, localSum strin
 		return false, err
 	}
 
-	remoteSum, err := verifyRemoteSha256(cnc, destFile, 30*time.Second)
+	remoteSum, err := verifyRemoteSha256(cnc, destFile)
 	if err != nil {
 		return false, fmt.Errorf("verifying remote checksum: %w", err)
 	}

@@ -1,6 +1,6 @@
 module github.com/mallowlabs/ec2-cp
 
-go 1.26.0
+go 1.27.3
 
 require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.9
